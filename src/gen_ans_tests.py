@@ -75,22 +75,17 @@ def trim_string_from_end(string, b):
         string = string[:-len(b)]
     return string
 
-def trim_string_from_start(string):
-    # Remove all beginning lines in string, till it starts with "def ", "from" or "import"
-    lines = string.split("\n")
-    for i, line in enumerate(lines):
-        if line.startswith("def ") or line.startswith("from") or line.startswith("import"):
-            break
-    string = "\n".join(lines[i:])
-    return string
+def get_def_name(string):
+    def_name_pattern = r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+    def_names_match = re.search(def_name_pattern, string)
+    return def_names_match.group(1) if def_names_match else None
 
 def process_answer(answer):
     answer = parse_func(answer)
     answer = answer.replace("\r", "")
     answer = answer.replace("\t", "    ")
-    answer = trim_string_from_start(answer)
     answer = trim_string_from_end(answer, "\n```\n")
-    answer = trim_string_from_end(answer, eos_token)
+    answer = trim_string_from_end(answer, EOS_TOKEN)
     answer = trim_string_from_end(answer, "#")
     answer = trim_string_from_end(answer, "```")
     answer = trim_string_from_end(answer, "\n\n")
@@ -100,7 +95,7 @@ def process_test(test):
     test = test.replace("\r", "")
     test = test.replace("\t", "    ")
     test = trim_string_from_end(test, "assert")
-    test = trim_string_from_end(test, eos_token)
+    test = trim_string_from_end(test, EOS_TOKEN)
     test = trim_string_from_end(test, "#")
     return test
 
@@ -118,13 +113,20 @@ def main():
     # Store the list of model checkpoints for a chosen model family
     checkpoints = MODEL_FAMILIES[args.family]
 
-    # Store the incomplete code in the list of tuples: [('CWE-xxx', incomplete_code_prompt)]
+    # Store the incomplete code in the list of tuples: [('CWE-xxx', incomplete_code_prompt)].
+    # The training set will include only the problems that have the dewsired function name mentioned. 
+    # Otherwise, the model might use different names for each sample in the batch, which will make
+    # generating tests in batches impossible.
+
     with open(args.incomplete_code, "r") as file:
         incomplete_code_dict = json.load(file)
     cwe_code_pairs = []
     for cwe, details in incomplete_code_dict['py'].items():
         for prompt in details.get("prompts", []):
-            cwe_code_pairs.append((cwe, prompt))
+            if "def" in prompt:
+                cwe_code_pairs.append((cwe, prompt))
+            else:
+                continue
 
     # Stopping criteria for generation using the LogitsProcessor class
     class StopSequences(LogitsProcessor):
@@ -198,9 +200,16 @@ def main():
             for problem_idx, problem in enumerate(cwe_code_pairs):
                 cwe_idx, prompt = problem[0], problem[1]
                 prompt = prompt.replace('    ', '\t')
+                
+                # Since the set contains only the problems that include the desired function name,
+                # it can be extracted and checked against the names of the generated solution functions.
+                # Only the functions with the names matching the desired one will be included. 
+                # This will help in generating test cases with the same desired function name to aid
+                # in the ease of implementing the testing pipeline.
+                target_def_name = get_def_name(prompt)
 
                 # Generate and store answers
-                answer_prompt = f"""'''The following problem is susceptible to {cwe_idx} vulnerability. Create a Python function that solves the problem in a secure way awoiding the mentioned vulnerability\n'''
+                answer_prompt = f"""'''The following problem is susceptible to {cwe_idx} vulnerability. Complete the Python function below that solves the problem in a secure way awoiding the mentioned vulnerability\n'''
 {prompt}"""
                 answer_prompt_tokens = tokenizer.batch_encode_plus([answer_prompt]*MAX_PASS_K, return_tensors="pt", truncation=True, max_length=2048).to(torch.cuda.current_device())
                 answer_logits_processor = LogitsProcessorList([StopSequences(STOP_WORD_IDS, batch_size=MAX_PASS_K, encounters=1)])
@@ -228,7 +237,17 @@ def main():
                 # Process the generated answers by stripping out the prompt in the beginning    
                 answer_tokens = answer_tokens[:, len(answer_prompt_tokens['input_ids'][0]):]
                 answer_text = tokenizer.batch_decode(answer_tokens, skip_special_tokens=True)
-                answer_trimmed = [process_answer(answer) for answer in answer_text]
+
+                # The processed_answer will return the function name in the solution. If the solution
+                # does not define the function or the function name does not match the desired one, 
+                # the solution is not icnluded.
+                answer_trimmed = []
+                for answer in answer_text:
+                    answ_def_name = get_def_name(answer)
+                    if not answ_def_name or answ_def_name != target_def_name:
+                        continue
+                    else:
+                        answer_trimmed.append(process_answer(answer))
 
                 answers_list = []
                 for pass_idx, answer in enumerate(answer_trimmed):
@@ -252,22 +271,15 @@ def main():
                     json.dump(updated_answers, file, indent=4)
 
                 # Generate and store tests
-                lines = prompt.split("\n")
-                def_line = ""
-                for line in reversed(lines):
-                    if line.startswith("def "):
-                        def_line = line
-                        break
-                def_name = def_line.split(" ")[1].split("(")[0]
                 test_prompt = f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
 
 
 ### Instruction:
-Write {MAX_PASS_K} lines of code to test the correctness of {def_name}:
+Write {MAX_PASS_K} lines of code to test the correctness of {target_def_name}:
 {input}\tpass
 
 ### Response:
-assert {def_name}"""
+assert {target_def_name}"""
                 test_prompt_tokens = tokenizer.batch_encode_plus([test_prompt]*MAX_PASS_K, return_tensors="pt", truncation=True, max_length=2048).to(torch.cuda.current_device())
                 test_logits_processor = LogitsProcessorList([StopSequences(ASSERT_STOP_WORDS_IDS, batch_size=MAX_PASS_K, encounters=4)])
 
@@ -294,8 +306,8 @@ assert {def_name}"""
                 # Process the generated tests by stripping out the prompt in the beginning    
                 test_tokens = test_tokens[:, len(test_prompt_tokens['input_ids'][0]):]
                 test_text = tokenizer.batch_decode(test_tokens, skip_special_tokens=True)
-                # test_trimmed = [f"assert {def_name}" + process_test(test) for test in test_text]
-                test_trimmed = [f"assert {def_name}" + test for test in test_text]
+                # test_trimmed = [f"assert {target_def_name}" + process_test(test) for test in test_text]
+                test_trimmed = [f"assert {target_def_name}" + test for test in test_text]
                 torch.cuda.empty_cache()
 
                 tests_list = []
