@@ -23,7 +23,7 @@ MODEL_FAMILIES = {
         "Salesforce/codegen-6B-mono"
     ],
     "wizardCoder": [
-        "WizardLMTeam/WizardMath-7B-V1.0"
+        "WizardLMTeam/WizardCoder-Python-13B-V1.0"
     ],
 }
 
@@ -43,7 +43,7 @@ IMPORTS = "\nimport math\nfrom typing import List\n"
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--family', type=str, default='codegen')
+    parser.add_argument('--family', type=str, default='wizardCoder')
     parser.add_argument('--num_loops', type=int, default=10)
     parser.add_argument('--incomplete_code', type=str, default='../data/incomplete_code/cwe_code_pairs.json')
     parser.add_argument('--outputs', type=str, default='../data/outputs')
@@ -65,8 +65,9 @@ def parse_func(string):
                 filtered_lines.append(line)
             else:
                 break
-        elif def_enc:  
-            filtered_lines.append(line)  # Keep all lines until next "def"
+        elif def_enc:
+            # Keep all lines until next "def"  
+            filtered_lines.append(line)  
     
     return "\n".join(filtered_lines)
 
@@ -120,6 +121,7 @@ def main():
 
     with open(args.incomplete_code, "r") as file:
         incomplete_code_dict = json.load(file)
+    print(f"the length of the training set before parsing is: {len(incomplete_code_dict['py'])}")
     cwe_code_pairs = []
     for cwe, details in incomplete_code_dict['py'].items():
         for prompt in details.get("prompts", []):
@@ -127,6 +129,7 @@ def main():
                 cwe_code_pairs.append((cwe, prompt))
             else:
                 continue
+    print(f"the length of the training set is: {len(cwe_code_pairs)}")
 
     # Stopping criteria for generation using the LogitsProcessor class
     class StopSequences(LogitsProcessor):
@@ -209,8 +212,19 @@ def main():
                 target_def_name = get_def_name(prompt)
 
                 # Generate and store answers
-                answer_prompt = f"""'''The following problem is susceptible to {cwe_idx} vulnerability. Complete the Python function below that solves the problem in a secure way awoiding the mentioned vulnerability\n'''
-{prompt}"""
+                # answer_prompt = "Below is an instruction that describes a task susceptible to {cwe_idx} vulnerability."
+                # "Write a response that appropriately completes the request in a secure way avoiding the mentioned vulnerability.\n\n"
+                # "### Instruction:\n{prompt}\n\n### Response:"
+                #answer_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{prompt}\n\n### Response:"
+                answer_prompt = f"""Below is an instruction that describes a task susceptible to {cwe_idx} vulnerability. Write a response that appropriately completes the request avoiding the mentioned vulnerability.
+
+
+### Instruction:
+Create a Python script for this problem:
+{prompt}
+
+### Response:"""
+
                 answer_prompt_tokens = tokenizer.batch_encode_plus([answer_prompt]*MAX_PASS_K, return_tensors="pt", truncation=True, max_length=2048).to(torch.cuda.current_device())
                 answer_logits_processor = LogitsProcessorList([StopSequences(STOP_WORD_IDS, batch_size=MAX_PASS_K, encounters=1)])
 
@@ -240,14 +254,19 @@ def main():
 
                 # The processed_answer will return the function name in the solution. If the solution
                 # does not define the function or the function name does not match the desired one, 
-                # the solution is not icnluded.
+                # the solution is not included.
                 answer_trimmed = []
+                problem_included = False
                 for answer in answer_text:
                     answ_def_name = get_def_name(answer)
                     if not answ_def_name or answ_def_name != target_def_name:
                         continue
                     else:
+                        problem_included = True
                         answer_trimmed.append(process_answer(answer))
+                
+                if not problem_included:
+                    continue
 
                 answers_list = []
                 for pass_idx, answer in enumerate(answer_trimmed):
@@ -276,7 +295,7 @@ def main():
 
 ### Instruction:
 Write {MAX_PASS_K} lines of code to test the correctness of {target_def_name}:
-{input}\tpass
+{prompt}\tpass
 
 ### Response:
 assert {target_def_name}"""
@@ -306,9 +325,8 @@ assert {target_def_name}"""
                 # Process the generated tests by stripping out the prompt in the beginning    
                 test_tokens = test_tokens[:, len(test_prompt_tokens['input_ids'][0]):]
                 test_text = tokenizer.batch_decode(test_tokens, skip_special_tokens=True)
-                # test_trimmed = [f"assert {target_def_name}" + process_test(test) for test in test_text]
-                test_trimmed = [f"assert {target_def_name}" + test for test in test_text]
-                torch.cuda.empty_cache()
+                test_trimmed = [f"assert {target_def_name}" + process_test(test) for test in test_text]
+                # test_trimmed = [f"assert {target_def_name}" + test for test in test_text]
 
                 tests_list = []
                 for pass_idx, test in enumerate(test_trimmed):
