@@ -23,6 +23,7 @@ MODEL_FAMILIES = {
         "Salesforce/codegen-6B-mono"
     ],
     "wizardCoder": [
+        "vanillaOVO/WizardCoder-Python-7B-V1.0",
         "WizardLMTeam/WizardCoder-Python-13B-V1.0"
     ],
 }
